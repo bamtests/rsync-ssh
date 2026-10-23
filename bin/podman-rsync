@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    printf 'Usage: podman-rsync [rsync-options...] SOURCE DEST\n' >&2
+    exit 2
+}
+
+(( $# >= 2 )) || usage
+
+podman=${PODMAN:-podman}
+image=${PODMAN_RSYNC_IMAGE:-rsync-ssh}
+command -v "$podman" >/dev/null 2>&1 || {
+    printf 'podman-rsync: Podman command not found: %s\n' "$podman" >&2
+    exit 127
+}
+command -v realpath >/dev/null 2>&1 || {
+    printf 'podman-rsync: realpath is required\n' >&2
+    exit 127
+}
+
+rsync_args=("$@")
+source_index=$(($# - 2))
+destination_index=$(($# - 1))
+mount_paths=()
+
+is_remote() {
+    [[ $1 != /* && $1 != */*:* && $1 == *:* ]]
+}
+
+for index in "$source_index" "$destination_index"; do
+    endpoint=${rsync_args[$index]}
+    [[ $endpoint == - ]] && continue
+    is_remote "$endpoint" && continue
+
+    trailing_slash=
+    [[ $endpoint == */ ]] && trailing_slash=/
+    [[ $endpoint == /* ]] || endpoint="$PWD/$endpoint"
+    endpoint=$(realpath -m -- "$endpoint")
+    [[ $endpoint == / ]] && {
+        printf 'podman-rsync: refusing to bind-mount the host root directory\n' >&2
+        exit 2
+    }
+    [[ $trailing_slash == / && $endpoint != / ]] && endpoint+=/
+    rsync_args[$index]=$endpoint
+
+    mount_path=${endpoint%/}
+    [[ -n $mount_path ]] || mount_path=/
+    if [[ ! -d $mount_path ]]; then
+        mount_path=$(dirname -- "$mount_path")
+        while [[ ! -d $mount_path && $mount_path != / ]]; do
+            mount_path=$(dirname -- "$mount_path")
+        done
+    fi
+    [[ $mount_path != / ]] || {
+        printf 'podman-rsync: endpoint must be below an existing directory other than /\n' >&2
+        exit 2
+    }
+
+    found=false
+    for existing_path in "${mount_paths[@]}"; do
+        [[ $existing_path == "$mount_path" ]] && found=true
+    done
+    [[ $found == true ]] || mount_paths+=("$mount_path")
+done
+
+podman_args=(run --rm --userns=keep-id:uid=1000,gid=1000)
+for mount_path in "${mount_paths[@]}"; do
+    podman_args+=(--volume "$mount_path:$mount_path:rw")
+done
+
+ssh_dir=${SSH_DIR:-${HOME:-}/.ssh}
+if [[ -d $ssh_dir ]]; then
+    ssh_dir=$(realpath -m -- "$ssh_dir")
+    podman_args+=(--volume "$ssh_dir:/home/rsync/.ssh:ro")
+fi
+
+if [[ -n ${SSH_AUTH_SOCK:-} && -S $SSH_AUTH_SOCK ]]; then
+    podman_args+=(--volume "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK" --env "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+fi
+
+exec "$podman" "${podman_args[@]}" "$image" --archive "${rsync_args[@]}"
